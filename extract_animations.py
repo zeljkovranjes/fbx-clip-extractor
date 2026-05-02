@@ -89,6 +89,12 @@ def parse_args():
                         help="Also write <output>/All-Clips.fbx with every clip from every input as a take.")
     parser.add_argument("--all-combined-only", action="store_true",
                         help="Skip the per-source pass entirely; only emit All-Clips.fbx.")
+    parser.add_argument("--strip-root-motion", nargs="?", const="XY", default=None,
+                        metavar="AXES",
+                        help="Zero out root-motion location keys. Pass axes to strip "
+                             "(e.g. 'XY', 'XYZ', 'Z'). With no value, defaults to 'XY' "
+                             "(strip horizontal, keep vertical for jump/bob). Strips both "
+                             "the armature object's location and the root bone's location.")
     return parser.parse_args(argv)
 
 
@@ -101,6 +107,41 @@ def sanitize_filename(name: str) -> str:
 def clean_clip_name(raw: str) -> str:
     """Strip leading 'N.' Unity-style numbering."""
     return re.sub(r"^\d+\.\s*", "", raw).strip()
+
+
+_AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
+
+
+def parse_axes(spec):
+    """Convert 'XY' / 'XYZ' / 'Z' into a set of fcurve array indices."""
+    if not spec:
+        return set()
+    out = set()
+    for ch in spec.upper():
+        if ch in _AXIS_INDEX:
+            out.add(_AXIS_INDEX[ch])
+    return out
+
+
+def strip_root_motion(action, root_bone_names, axis_indices):
+    """Zero location keyframes on the armature object and named root bones for
+    the given axis indices. In-place modification."""
+    if not axis_indices:
+        return
+    targets = {"location"} | {f'pose.bones["{bn}"].location' for bn in root_bone_names}
+    for fc in list(action.fcurves):
+        if fc.data_path not in targets:
+            continue
+        if fc.array_index not in axis_indices:
+            continue
+        for kp in fc.keyframe_points:
+            # Explicit tuple reassignment — Vector item assignment doesn't
+            # always flag the fcurve dirty in Blender 4.x.
+            kp.co          = (kp.co.x,          0.0)
+            kp.handle_left  = (kp.handle_left.x,  0.0)
+            kp.handle_right = (kp.handle_right.x, 0.0)
+            kp.interpolation = "LINEAR"
+        fc.update()
 
 
 # ---------------------------------------------------------------------------
@@ -334,16 +375,21 @@ def export_bundle(armature, actions, output_path, armature_only, prime=True):
 # Per-source pass (writes per-clip files and optionally a per-source bundle)
 # ---------------------------------------------------------------------------
 
-def build_clip_actions(input_path, master_action=None, meta_override=None, no_meta=False):
+def build_clip_actions(input_path, master_action=None, meta_override=None, no_meta=False,
+                       strip_axes=None):
     """After importing `input_path`, slice the master action into clip actions.
     Returns (armature, [(clip_name, action, first, last), ...], used_meta).
 
     `master_action` should be the freshly-imported source action; if None, the
     first entry in bpy.data.actions is used (correct only when the scene was
-    cleared right before the import)."""
+    cleared right before the import).
+
+    `strip_axes` is a set of fcurve array indices ({0, 1, 2}) for axes whose
+    root-motion location keys should be zeroed on each produced clip."""
     armature = find_armature()
     if armature is None:
         raise RuntimeError("No armature found in source FBX.")
+    root_bones = [b.name for b in armature.data.bones if b.parent is None]
 
     meta_path = None
     if not no_meta:
@@ -388,6 +434,8 @@ def build_clip_actions(input_path, master_action=None, meta_override=None, no_me
             except Exception as e:
                 print(f"[FAIL]   Could not slice '{clip_name}': {e}")
                 continue
+            if strip_axes:
+                strip_root_motion(clip_action, root_bones, strip_axes)
             built.append((clip_name, clip_action, 0, int(round(clip_action.frame_range[1]))))
 
         # The master action is no longer needed.
@@ -403,9 +451,16 @@ def build_clip_actions(input_path, master_action=None, meta_override=None, no_me
                 print(f"[WARN]   Skipping '{action.name}' (zero fcurves)")
                 continue
             action.use_fake_user = True
+            if strip_axes:
+                strip_root_motion(action, root_bones, strip_axes)
             start, end = action.frame_range
             built.append((clean_clip_name(action.name), action,
                           int(round(start)), int(round(end))))
+
+    if strip_axes:
+        axis_str = "".join(c for c, i in zip("XYZ", range(3)) if i in strip_axes)
+        print(f"[INFO]   Stripped root-motion axes '{axis_str}' from "
+              f"{len(built)} clip(s); root bones: {root_bones}")
 
     return armature, built, used_meta
 
@@ -424,6 +479,7 @@ def process_source(input_path, output_root, args):
         input_path,
         meta_override=args.meta if len(args.input) == 1 else None,
         no_meta=args.no_meta,
+        strip_axes=parse_axes(args.strip_root_motion),
     )
 
     if not built:
@@ -517,6 +573,7 @@ def export_all_combined(inputs, output_path, args):
             master_action=master_action,
             meta_override=None,
             no_meta=args.no_meta,
+            strip_axes=parse_axes(args.strip_root_motion),
         )
 
         # Disambiguate clip names across sources by prefixing the source stem

@@ -42,6 +42,7 @@ Everything after `--` is forwarded to the script.
 | `--combined-only` | flag | Skip per-clip files; only write the per-source bundle. |
 | `--all-combined` | flag | Across all inputs: also write `All-Clips.fbx` (every clip as a take). |
 | `--all-combined-only` | flag | Skip the per-source pass entirely; only write `All-Clips.fbx`. |
+| `--strip-root-motion [AXES]` | flag/value | Zero out root-motion location keys on the armature object and the root bone. Optional axes string (e.g. `XY`, `XYZ`, `Z`). With no value, defaults to `XY` (strip horizontal, keep vertical for jump/bob). |
 
 ## Examples
 
@@ -198,3 +199,25 @@ Constants near the top of `extract_animations.py` control the FBX export:
 - The `.meta` sidecar is 0-indexed; Blender's import is usually 1-indexed. The script auto-detects and applies the offset.
 - In `--all-combined` mode, name collisions across sources get a `<source>_<clip>` prefix. Clean clip names always win when unique.
 - All inputs share the first source's armature for the bundled export; safe as long as bone names match across files (they do for any pack built on a single Mecanim humanoid rig).
+
+## Stripping root motion
+
+Use `--strip-root-motion` when you want in-place clips (no character displacement). Common with engines that drive locomotion programmatically, or when blending root-motion clips causes flickering / position jumps.
+
+```
+# Default: strip horizontal motion only (X and Y in Blender's Z-up world)
+--strip-root-motion
+
+# Explicit axes (any combination of X, Y, Z)
+--strip-root-motion XY    # horizontal only (default)
+--strip-root-motion XYZ   # full in-place — no displacement at all
+--strip-root-motion Z     # only vertical (rare)
+```
+
+What it actually zeroes per clip:
+- The armature object's `location` channels for the chosen axes.
+- The root bone's `pose.bones["..."].location` channels for the chosen axes (root = any bone with no parent).
+
+**Important nuance.** Sometimes you want to keep Z (vertical) location for jumping or vertical bobbing. For walking animations you usually want to delete X and Y (horizontal motion) but might leave Z (slight up/down bob). For pure idle/attack/defense clips on a flat floor, strip all three. **Test in your engine and see what looks right** — the right answer is rig- and clip-dependent.
+
+Axis names refer to Blender's Z-up world. Most game engines that consume the resulting FBX (s&box / Source 2, Unreal) treat the kept axis as their vertical, which matches what you'd intuitively expect. Unity Y-up users may need to swap which axes they strip — re-read the exported clip and check.
