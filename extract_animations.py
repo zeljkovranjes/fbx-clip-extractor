@@ -274,17 +274,40 @@ def export_single_clip(armature, action, output_path, frame_start, frame_end, ar
     )
 
 
-def export_bundle(armature, actions, output_path, armature_only):
-    """Export a single FBX containing every action in `actions` as its own take."""
-    # Trim bpy.data.actions down to exactly the actions we want exported.
+def export_bundle(armature, actions, output_path, armature_only, prime=True):
+    """Export a single FBX with every action in `actions` as its own take.
+
+    `bake_anim_use_all_actions=True` only bakes the actual action data when
+    Blender has previously evaluated the action against the armature via a
+    real export pass; otherwise it silently emits rest pose. When the caller
+    cannot guarantee that has already happened (e.g. the all-combined path),
+    pass `prime=True` to force a throwaway per-action export pass first."""
+    import tempfile
+
     keep = {a.name for a in actions}
     for a in list(bpy.data.actions):
         if a.name not in keep:
             bpy.data.actions.remove(a)
 
-    clear_nla(armature)
     if armature.animation_data is None:
         armature.animation_data_create()
+    clear_nla(armature)
+
+    if prime:
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, action in enumerate(actions):
+                tmp_path = os.path.join(tmp, f"_prime_{i}.fbx")
+                try:
+                    export_single_clip(
+                        armature, action, tmp_path,
+                        int(round(action.frame_range[0])),
+                        int(round(action.frame_range[1])),
+                        armature_only,
+                    )
+                except Exception as e:
+                    print(f"[WARN]   Prime pass failed for '{action.name}': {e}")
+
+    clear_nla(armature)
     armature.animation_data.action = actions[0]
 
     object_types = _select_for_export(armature, armature_only)
@@ -440,7 +463,10 @@ def process_source(input_path, output_root, args):
         bundle_path = os.path.join(source_out, f"{source_stem}-Clips.fbx")
         actions = [b[1] for b in built]
         try:
-            export_bundle(armature, actions, bundle_path, args.armature_only)
+            # Per-clip exports above already primed the actions; skip the
+            # heavy prime pass when they ran.
+            export_bundle(armature, actions, bundle_path, args.armature_only,
+                          prime=not write_per_clip)
             print(f"[SUMMARY]   Bundle written: {bundle_path}")
         except Exception as e:
             print(f"[FAIL]   Bundle failed: {e}")
@@ -511,17 +537,24 @@ def export_all_combined(inputs, output_path, args):
             all_actions.append(action)
 
         # Keep the first armature alive, drop all subsequently-imported ones
-        # (their meshes too) so the final scene only has one rig.
+        # Drop later sources' armatures + meshes, but keep the canonical
+        # source's armature AND its meshes. The meshes carry the Armature
+        # modifier that forces pose-bone evaluation during bake; deleting
+        # them makes the FBX exporter silently emit rest pose.
         new_armatures = [o for o in bpy.data.objects
                          if o.type == "ARMATURE" and o.name not in armatures_before]
         new_meshes    = [o for o in bpy.data.objects
                          if o.type == "MESH" and o.name not in meshes_before]
 
-        if canonical_armature is None and new_armatures:
+        first_iteration = canonical_armature is None
+        if first_iteration and new_armatures:
             canonical_armature = new_armatures[0]
             new_armatures = new_armatures[1:]
 
-        for obj in new_armatures + new_meshes:
+        # On the first iteration we keep this source's meshes so the canonical
+        # armature has skinned geometry for pose evaluation.
+        meshes_to_drop = [] if first_iteration else new_meshes
+        for obj in new_armatures + meshes_to_drop:
             if obj.name in bpy.data.objects:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
@@ -533,8 +566,9 @@ def export_all_combined(inputs, output_path, args):
         return False
 
     print(f"[INFO]   {len(all_actions)} take(s) ready -> {output_path}")
+    print(f"[INFO]   Priming {len(all_actions)} action(s) (one throwaway export each); this may take a minute...")
     try:
-        export_bundle(canonical_armature, all_actions, output_path, args.armature_only)
+        export_bundle(canonical_armature, all_actions, output_path, args.armature_only, prime=True)
         print(f"[SUMMARY]   All-Clips bundle written: {output_path}")
         return True
     except Exception as e:
